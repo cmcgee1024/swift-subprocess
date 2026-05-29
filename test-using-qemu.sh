@@ -128,7 +128,8 @@ GUEST COMMAND (after --):
   Runs as root inside the VM, in /mnt/host, with Swift on PATH.
   Default: swift test
 
-ENVIRONMENT: VM_MEMORY  VM_CPUS  SSH_PORT  KEEP_WORK  WORK_DIR  TMPDIR
+ENVIRONMENT: VM_MEMORY  VM_CPUS  SSH_PORT  KEEP_WORK  WORK_DIR  VM_DISK_SIZE  TMPDIR
+  Note: use "sudo VAR=val ./$(basename "$0")" — plain "VAR=val sudo ..." is stripped by sudo.
 
 NOTES:
   - disk mode images require cloud-init in the guest (Ubuntu, Debian, Fedora, AlmaLinux do).
@@ -372,9 +373,15 @@ USERDATA
                 "$CLOUD_DIR/user-data" "$CLOUD_DIR/meta-data" 2>/dev/null ;;
     esac
 
-    # COW overlay keeps the base image pristine; --keep-image reuses the base
+    # COW overlay keeps the base image pristine; --keep-image reuses the base.
+    # Resize the overlay if VM_DISK_SIZE is set — cloud-init's growpart module
+    # will expand the partition and filesystem to fill the new size on first boot.
     OVERLAY_IMAGE="$WORK_DIR/overlay.qcow2"
     qemu-img create -q -f qcow2 -b "$USERSPACE_FILE" -F qcow2 "$OVERLAY_IMAGE"
+    if [[ -n "${VM_DISK_SIZE:-}" ]]; then
+        qemu-img resize -q "$OVERLAY_IMAGE" "$VM_DISK_SIZE"
+        info "Overlay resized to $VM_DISK_SIZE (cloud-init will expand partition on first boot)"
+    fi
 
     QEMU_CMD=(
         "$QEMU_BIN"
@@ -554,6 +561,9 @@ SVCEOF
         for _ in $(seq 1 15); do [[ -b "${LOOP_DEV}p1" ]] && break; sleep 1; done
         [[ -b "${LOOP_DEV}p1" ]] || error "Partition ${LOOP_DEV}p1 did not appear."
         mkfs.ext4 -F -L root -d "$ROOTFS_DIR" "${LOOP_DEV}p1"
+        # Some e2fsprogs versions size the filesystem to directory contents rather
+        # than the full partition when -d is used; resize2fs corrects that.
+        resize2fs "${LOOP_DEV}p1" &>/dev/null || true
         losetup -d "$LOOP_DEV" 2>/dev/null || true
 
         step "Converting to qcow2..."
