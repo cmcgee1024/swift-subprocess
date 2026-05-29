@@ -58,6 +58,19 @@ jobs:
         done
         # empty line to ignore the --swift-sdk given by swiftlang/github-workflows/.github/workflows/scripts/install-and-build-with-sdk.sh \
 
+  test_old_linux_kernel:
+    name: Test Old Linux Kernel
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    container:
+      image: ubuntu:24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Run Test
+        run: bash -c './scripts/test-using-qemu.sh al2-5.10'
+
   soundness:
     name: Soundness
     uses: swiftlang/github-workflows/.github/workflows/soundness.yml@0.0.11
