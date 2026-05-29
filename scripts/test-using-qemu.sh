@@ -132,6 +132,7 @@ ENVIRONMENT: VM_MEMORY  VM_CPUS  SSH_PORT  KEEP_WORK  WORK_DIR  VM_DISK_SIZE  TM
   Note: use "sudo VAR=val ./$(basename "$0")" — plain "VAR=val sudo ..." is stripped by sudo.
 
 NOTES:
+  - Host must be Ubuntu (apt-get is used for tool installation); python3 must be available.
   - disk mode images require cloud-init in the guest (Ubuntu, Debian, Fedora, AlmaLinux do).
   - rootfs mode (e.g. al2-5.10) fetches userspace from LXC and kernel from a donor disk image.
   - lxc-disk kernel mode downloads a second LXC disk.qcow2 and extracts vmlinuz+initrd via debugfs.
@@ -515,20 +516,18 @@ SVCEOF
             step "Downloading donor disk.qcow2..."
             curl -f --progress-bar -o "$DONOR_QCOW" "$DONOR_URL_BASE/$DONOR_BUILD/disk.qcow2"
 
-            # Convert to raw so sfdisk+dd can extract partitions without losetup
+            # Convert to raw so dd can extract partitions without losetup
             DONOR_RAW="$WORK_DIR/kernel-donor.raw"
             step "Converting donor image to raw..."
             qemu-img convert -f qcow2 -O raw "$DONOR_QCOW" "$DONOR_RAW"
             rm -f "$DONOR_QCOW"
 
-            # Walk partitions using sfdisk (reads partition table from the raw file
-            # directly — no loop device or block device access required).
-            # dd with conv=sparse extracts each partition to a temp file for debugfs.
+            # Parse the partition table with Python3 — reads MBR/GPT bytes directly
+            # from the raw file, no sfdisk/losetup/block device access needed.
+            # Outputs one "START SIZE" line per partition (in 512-byte sectors).
             VMLINUZ_FOUND=false
             DONOR_PART="$WORK_DIR/donor-part.raw"
-            while IFS= read -r PART_LINE; do
-                START=$(echo "$PART_LINE" | grep -oP 'start=\s*\K[0-9]+')
-                SIZE=$(echo  "$PART_LINE" | grep -oP 'size=\s*\K[0-9]+')
+            while IFS=' ' read -r START SIZE; do
                 [[ -z "$START" || -z "$SIZE" ]] && continue
                 dd if="$DONOR_RAW" of="$DONOR_PART" bs=512 \
                     skip="$START" count="$SIZE" conv=sparse 2>/dev/null
@@ -547,7 +546,41 @@ SVCEOF
                     [[ -n "$INITRD_NAME" ]] && info "Initrd: $INITRD_NAME"
                     break
                 fi
-            done < <(sfdisk -d "$DONOR_RAW" 2>/dev/null | grep 'start=')
+            done < <(python3 - "$DONOR_RAW" <<'PYEOF'
+import struct, sys
+
+def parse(path):
+    with open(path, 'rb') as f:
+        s0 = f.read(512)
+    if len(s0) < 512 or s0[510:512] != b'\x55\xaa':
+        return
+    if s0[446 + 4] == 0xEE:           # protective MBR → GPT disk
+        with open(path, 'rb') as f:
+            f.seek(512); h = f.read(512)
+        if h[:8] != b'EFI PART':
+            return
+        elba = struct.unpack_from('<Q', h, 72)[0]
+        ne   = struct.unpack_from('<I', h, 80)[0]
+        es   = struct.unpack_from('<I', h, 84)[0]
+        with open(path, 'rb') as f:
+            f.seek(elba * 512); ed = f.read(ne * es)
+        for i in range(ne):
+            e = ed[i * es:(i + 1) * es]
+            if all(b == 0 for b in e[:16]):   # empty type GUID → unused entry
+                continue
+            s, end = struct.unpack_from('<QQ', e, 32)
+            if s > 0:
+                print(s, end - s + 1)
+    else:                              # MBR / DOS partition table
+        for i in range(4):
+            e = s0[446 + i * 16:462 + i * 16]
+            s, n = struct.unpack_from('<II', e, 8)
+            if s > 0 and n > 0 and e[4] != 0:
+                print(s, n)
+
+parse(sys.argv[1])
+PYEOF
+)
             rm -f "$DONOR_PART" "$DONOR_RAW"
             [[ "$VMLINUZ_FOUND" != "true" ]] && error "No vmlinuz found in donor disk image"
         fi
