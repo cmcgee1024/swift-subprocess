@@ -223,7 +223,7 @@ esac
 install_tools() {
     step "Installing required tools..."
     apt-get update -qq
-    local pkgs=(qemu-utils openssh-client gpg curl cpio genisoimage parted xz-utils)
+    local pkgs=(qemu-utils openssh-client gpg curl genisoimage xz-utils)
     case "$ARCH" in
         amd64|x86_64) pkgs+=(qemu-system-x86) ;;
         arm64|aarch64) pkgs+=(qemu-system-arm qemu-efi-aarch64) ;;
@@ -493,7 +493,7 @@ SVCEOF
                 "$ROOTFS_DIR/etc/systemd/system/multi-user.target.wants/qemu-bootstrap-sshd.service"
         fi
 
-        printf '/dev/vda1  /     ext4  defaults  0 1\ntmpfs  /tmp  tmpfs  defaults  0 0\n' \
+        printf '/dev/vda  /     ext4  defaults  0 1\ntmpfs  /tmp  tmpfs  defaults  0 0\n' \
             > "$ROOTFS_DIR/etc/fstab"
 
         # ── Fetch kernel from LXC donor disk image (lxc-disk mode) ──────────────
@@ -515,56 +515,55 @@ SVCEOF
             step "Downloading donor disk.qcow2..."
             curl -f --progress-bar -o "$DONOR_QCOW" "$DONOR_URL_BASE/$DONOR_BUILD/disk.qcow2"
 
-            # Convert to raw so losetup can attach it (ioctl-based, no mount syscall)
+            # Convert to raw so sfdisk+dd can extract partitions without losetup
             DONOR_RAW="$WORK_DIR/kernel-donor.raw"
-            step "Converting donor image to raw for losetup..."
+            step "Converting donor image to raw..."
             qemu-img convert -f qcow2 -O raw "$DONOR_QCOW" "$DONOR_RAW"
             rm -f "$DONOR_QCOW"
 
-            DONOR_LOOP=$(losetup -f --show --partscan "$DONOR_RAW")
-            for _ in $(seq 1 15); do ls "${DONOR_LOOP}p"* &>/dev/null 2>&1 && break; sleep 1; done
-
-            # Walk partitions and use debugfs to find the one containing /boot/vmlinuz-*
+            # Walk partitions using sfdisk (reads partition table from the raw file
+            # directly — no loop device or block device access required).
+            # dd with conv=sparse extracts each partition to a temp file for debugfs.
             VMLINUZ_FOUND=false
-            for part in "${DONOR_LOOP}p"*; do
-                [[ -b "$part" ]] || continue
-                if debugfs -R "ls /boot" "$part" 2>/dev/null | grep -q "vmlinuz"; then
-                    step "Extracting kernel+initrd from $part..."
-                    VMLINUZ_NAME=$(debugfs -R "ls /boot" "$part" 2>/dev/null \
+            DONOR_PART="$WORK_DIR/donor-part.raw"
+            while IFS= read -r PART_LINE; do
+                START=$(echo "$PART_LINE" | grep -oP 'start=\s*\K[0-9]+')
+                SIZE=$(echo  "$PART_LINE" | grep -oP 'size=\s*\K[0-9]+')
+                [[ -z "$START" || -z "$SIZE" ]] && continue
+                dd if="$DONOR_RAW" of="$DONOR_PART" bs=512 \
+                    skip="$START" count="$SIZE" conv=sparse 2>/dev/null
+                if debugfs -R "ls /boot" "$DONOR_PART" 2>/dev/null | grep -q "vmlinuz"; then
+                    step "Extracting kernel+initrd from partition at sector $START..."
+                    VMLINUZ_NAME=$(debugfs -R "ls /boot" "$DONOR_PART" 2>/dev/null \
                         | grep -oE 'vmlinuz-[^ <]+' | sort -V | tail -1)
-                    INITRD_NAME=$(debugfs -R "ls /boot" "$part" 2>/dev/null \
+                    INITRD_NAME=$(debugfs -R "ls /boot" "$DONOR_PART" 2>/dev/null \
                         | grep -oE 'initrd\.img-[^ <]+' | sort -V | tail -1)
                     [[ -z "$VMLINUZ_NAME" ]] && continue
-                    debugfs -R "dump /boot/$VMLINUZ_NAME $WORK_DIR/vmlinuz" "$part" 2>/dev/null
+                    debugfs -R "dump /boot/$VMLINUZ_NAME $WORK_DIR/vmlinuz" "$DONOR_PART" 2>/dev/null
                     [[ -n "$INITRD_NAME" ]] && \
-                        debugfs -R "dump /boot/$INITRD_NAME $WORK_DIR/initrd.img" "$part" 2>/dev/null
+                        debugfs -R "dump /boot/$INITRD_NAME $WORK_DIR/initrd.img" "$DONOR_PART" 2>/dev/null
                     VMLINUZ_FOUND=true
                     info "Kernel: $VMLINUZ_NAME"
                     [[ -n "$INITRD_NAME" ]] && info "Initrd: $INITRD_NAME"
                     break
                 fi
-            done
-
-            losetup -d "$DONOR_LOOP" 2>/dev/null || true
-            rm -f "$DONOR_RAW"
+            done < <(sfdisk -d "$DONOR_RAW" 2>/dev/null | grep 'start=')
+            rm -f "$DONOR_PART" "$DONOR_RAW"
             [[ "$VMLINUZ_FOUND" != "true" ]] && error "No vmlinuz found in donor disk image"
         fi
 
         # ── Create disk image from rootfs directory (no mount needed) ─────────
-        step "Creating disk image via mkfs.ext4 -d..."
+        step "Creating disk image via mkfs.ext4 -d (no losetup required)..."
         RAW_IMAGE="$WORK_DIR/vm.raw"
         DISK_SIZE="${VM_DISK_SIZE:-10G}"
         truncate -s "$DISK_SIZE" "$RAW_IMAGE"
-        parted -s "$RAW_IMAGE" mklabel msdos
-        parted -s "$RAW_IMAGE" mkpart primary ext4 1MiB 100%
-        LOOP_DEV=$(losetup -f --show --partscan "$RAW_IMAGE")
-        for _ in $(seq 1 15); do [[ -b "${LOOP_DEV}p1" ]] && break; sleep 1; done
-        [[ -b "${LOOP_DEV}p1" ]] || error "Partition ${LOOP_DEV}p1 did not appear."
-        mkfs.ext4 -F -L root -d "$ROOTFS_DIR" "${LOOP_DEV}p1"
+        # Write the filesystem directly onto the raw file — no partition table needed
+        # since we boot with -kernel (root=/dev/vda, no partition suffix).
+        # This also eliminates the parted + losetup dependency entirely.
+        mkfs.ext4 -F -L root -d "$ROOTFS_DIR" "$RAW_IMAGE"
         # Some e2fsprogs versions size the filesystem to directory contents rather
-        # than the full partition when -d is used; resize2fs corrects that.
-        resize2fs "${LOOP_DEV}p1" &>/dev/null || true
-        losetup -d "$LOOP_DEV" 2>/dev/null || true
+        # than the full file when -d is used; resize2fs corrects that.
+        resize2fs "$RAW_IMAGE" &>/dev/null || true
 
         step "Converting to qcow2..."
         qemu-img convert -f raw -O qcow2 "$RAW_IMAGE" "$DISK_IMAGE"
@@ -578,7 +577,7 @@ SVCEOF
     [[ -f "$QEMU_KERNEL" ]] || error "Kernel not found at $QEMU_KERNEL"
 
     # net.ifnames=0: use eth0 naming so NetworkManager/ifcfg finds the NIC
-    KERNEL_APPEND="root=/dev/vda1 rw console=ttyS0,115200n8 net.ifnames=0 biosdevname=0 quiet"
+    KERNEL_APPEND="root=/dev/vda rw console=ttyS0,115200n8 net.ifnames=0 biosdevname=0 quiet"
 
     QEMU_CMD=(
         "$QEMU_BIN"
