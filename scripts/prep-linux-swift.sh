@@ -2,7 +2,7 @@
 
 # This script does a bit of extra preparation of the docker containers used to run the GitHub workflows
 # that are specific to this project's needs when building/testing. Note that this script runs on
-# every supported Linux distribution and macOS so it must adapt to the distribution that it is running.
+# every supported Linux distribution so it must adapt to the distribution that it is running.
 
 if [[ "$(uname -s)" == "Linux" ]]; then
     # Install the basic utilities depending on the type of Linux distribution
@@ -31,18 +31,8 @@ done
 if [ "$installSwiftly" == true ]; then
     echo "Installing swiftly"
 
-    if [[ "$(uname -s)" == "Linux" ]]; then
-        curl -O https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz && tar zxf swiftly-*.tar.gz && ./swiftly init -y --skip-install
-        . "/root/.local/share/swiftly/env.sh"
-    else
-        export SWIFTLY_HOME_DIR="$(pwd)/swiftly-bootstrap"
-        export SWIFTLY_BIN_DIR="$SWIFTLY_HOME_DIR/bin"
-        export SWIFTLY_TOOLCHAINS_DIR="$SWIFTLY_HOME_DIR/toolchains"
-
-        curl -O https://download.swift.org/swiftly/darwin/swiftly.pkg && pkgutil --check-signature swiftly.pkg && pkgutil --verbose --expand swiftly.pkg "${SWIFTLY_HOME_DIR}" && tar -C "${SWIFTLY_HOME_DIR}" -xvf "${SWIFTLY_HOME_DIR}"/swiftly-*/Payload && "$SWIFTLY_HOME_DIR/bin/swiftly" init -y --skip-install
-
-        . "$SWIFTLY_HOME_DIR/env.sh"
-    fi
+    curl -O https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz && tar zxf swiftly-*.tar.gz && ./swiftly init -y --skip-install
+    . "/root/.local/share/swiftly/env.sh"
 
     hash -r
 
@@ -63,7 +53,7 @@ if [ "$installSwiftly" == true ]; then
         runSelector=("+latest")
     fi
 
-    swiftly install --post-install-file=post-install.sh "${selector[@]}"
+    TMPDIR=/var/tmp swiftly install --post-install-file=post-install.sh "${selector[@]}"
 
     if [ -f post-install.sh ]; then
         echo "Performing swift toolchain post-installation"
